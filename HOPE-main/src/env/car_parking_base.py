@@ -1,22 +1,19 @@
 '''
-This is a collision-free env which only includes one parking case with random start position.
+Ackermann car navigation in a forest-style occupancy grid with random start/goal.
 '''
 
 
 import sys
 sys.path.append("../")
-from typing import Optional, Union
+from typing import Optional
 import math
 from typing import OrderedDict
-import random
 
 import numpy as np
 import gym
 from gym import spaces
 from gym.error import DependencyNotInstalled
-from shapely.geometry import Polygon
 from shapely.affinity import affine_transform
-from heapdict import heapdict
 try:
     # As pygame is necessary for using the environment (reset and step) even without a render mode
     #   therefore, pygame is a necessary import for the environment.
@@ -29,9 +26,8 @@ except ImportError:
 from env.vehicle import *
 from env.map_base import *
 from env.lidar_simulator import LidarSimlator
-from env.parking_map_normal import ParkingMapNormal
-from env.parking_map_dlp import ParkingMapDLP
-import env.reeds_shepp as rsCurve
+from env.forest_map import ForestMap
+from env.hybrid_astar import plan_hybrid_astar
 from env.observation_processor import Obs_Processor
 from model.action_mask import ActionMask
 from configs import *
@@ -70,16 +66,14 @@ class CarParking(gym.Env):
         self.k = None
         self.level = MAP_LEVEL
         self.tgt_repr_size = 5 # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
+        self.goal_tolerance = GOAL_TOLERANCE
 
-        if self.level in ['Normal', 'Complex', 'Extrem']:
-            self.map = ParkingMapNormal(self.level)
-        elif self.level == 'dlp':
-            self.map = ParkingMapDLP()
+        self.map = ForestMap(self.level)
         self.vehicle = Vehicle(n_step=NUM_STEP, step_len=STEP_LENGTH)
         self.lidar = LidarSimlator(LIDAR_RANGE, LIDAR_NUM)
         self.reward = 0.0
         self.prev_reward = 0.0
-        self.accum_arrive_reward = 0.0
+        self.prev_action = np.zeros(2)
 
         self.action_space = spaces.Box(
             np.array([VALID_STEER[0], VALID_SPEED[0]]).astype(np.float32),
@@ -116,19 +110,15 @@ class CarParking(gym.Env):
     
     def set_level(self, level:str=None):
         if level is None:
-            self.map = ParkingMapNormal()
-            return
+            level = MAP_LEVEL
         self.level = level
-        if self.level in ['Normal', 'Complex', 'Extrem',]:
-            self.map = ParkingMapNormal(self.level)
-        elif self.level == 'dlp':
-            self.map = ParkingMapDLP()
+        self.map = ForestMap(self.level)
 
     def reset(self, case_id: int = None, data_dir: str = None, level: str = None,) -> np.ndarray:
         self.reward = 0.0
         self.prev_reward = 0.0
-        self.accum_arrive_reward = 0.0
         self.t = 0.0
+        self.prev_action = np.zeros(2)
 
         if level is not None:
             self.set_level(level)
@@ -234,12 +224,14 @@ class CarParking(gym.Env):
         return x>self.map.xmax or x<self.map.xmin or y>self.map.ymax or y<self.map.ymin
 
     def _check_arrived(self):
-        vehicle_box = Polygon(self.vehicle.box)
-        dest_box = Polygon(self.map.dest_box)
-        union_area = vehicle_box.intersection(dest_box).area
-        if union_area / dest_box.area > 0.95:
+        dist = self.vehicle.state.loc.distance(self.map.dest.loc)
+        if dist > self.goal_tolerance:
+            return False
+        if GOAL_HEADING_TOL is None:
             return True
-        return False
+        heading_err = abs(math.atan2(math.sin(self.vehicle.state.heading - self.map.dest.heading), 
+            math.cos(self.vehicle.state.heading - self.map.dest.heading)))
+        return heading_err <= GOAL_HEADING_TOL
     
     def _check_time_exceeded(self):
         return self.t > TOLERANT_TIME
@@ -255,54 +247,33 @@ class CarParking(gym.Env):
             return Status.OUTTIME
         return Status.CONTINUE
 
-    def _get_reward(self, prev_state: State, curr_state: State):
+    def _get_reward(self, prev_state: State, curr_state: State, status: Status, action:np.ndarray):
+        prev_dist = prev_state.loc.distance(self.map.dest.loc)
+        curr_dist = curr_state.loc.distance(self.map.dest.loc)
+        progress = np.clip(prev_dist - curr_dist, -PROGRESS_CLIP, PROGRESS_CLIP)
 
-        # time penalty
-        time_cost = - np.tanh(self.t / (10*TOLERANT_TIME))
+        collision_penalty = 0.0
+        if status == Status.COLLIDED:
+            collision_penalty = -COLLISION_PENALTY
+        elif status == Status.OUTBOUND:
+            collision_penalty = -OUTBOUND_PENALTY
+        elif status == Status.OUTTIME:
+            collision_penalty = -TIMEOUT_PENALTY
 
-        # RS distance reward
-        if REWARD_WEIGHT['rs_dist_reward'] != 0:
-            radius = math.tan(VALID_STEER[-1])/WHEEL_BASE
-            curr_rs_dist = rsCurve.calc_optimal_path(*curr_state.get_pos(), *self.map.dest.get_pos(), radius , 0.1).L
-            prev_rs_dist = rsCurve.calc_optimal_path(*prev_state.get_pos(), *self.map.dest.get_pos(), radius, 0.1).L
-            rs_dist_norm_ratio = rsCurve.calc_optimal_path(*self.map.start.get_pos(), *self.map.dest.get_pos(), radius, 0.1).L
-            rs_dist_reward = math.exp(-curr_rs_dist/rs_dist_norm_ratio) - \
-                math.exp(-prev_rs_dist/rs_dist_norm_ratio)
-        else:
-            rs_dist_reward = 0
-
-        # Euclidean distance reward & angle reward
-        def get_angle_diff(angle1, angle2):
-            # norm to 0 ~ pi/2
-            angle_dif = math.acos(math.cos(angle1 - angle2)) # 0~pi
-            return angle_dif if angle_dif<math.pi/2 else math.pi-angle_dif
-        dist_diff = curr_state.loc.distance(self.map.dest.loc)
-        angle_diff = get_angle_diff(curr_state.heading, self.map.dest.heading)
-        prev_dist_diff = prev_state.loc.distance(self.map.dest.loc)
-        prev_angle_diff = get_angle_diff(prev_state.heading, self.map.dest.heading)
-        dist_norm_ratio = max(self.map.dest.loc.distance(self.map.start.loc),10)
-        angle_norm_ratio = math.pi
-        dist_reward = prev_dist_diff/dist_norm_ratio - dist_diff/dist_norm_ratio
-        angle_reward = prev_angle_diff/angle_norm_ratio - angle_diff/angle_norm_ratio
+        smoothness_penalty = 0.0
+        if action is not None:
+            delta_steer = abs(action[0] - self.prev_action[0])
+            delta_speed = abs(action[1] - self.prev_action[1])
+            steer_norm = max(VALID_STEER[1] - VALID_STEER[0], 1e-6)
+            speed_norm = max(VALID_SPEED[1] - VALID_SPEED[0], 1e-6)
+            smoothness_penalty = -(
+                SMOOTHNESS_STEER_WEIGHT * delta_steer / steer_norm +
+                SMOOTHNESS_SPEED_WEIGHT * delta_speed / speed_norm
+            )
+        return [progress, collision_penalty, smoothness_penalty]
         
-        # Box union reward
-        vehicle_box = Polygon(self.vehicle.box)
-        dest_box = Polygon(self.map.dest_box)
-        union_area = vehicle_box.intersection(dest_box).area
-        box_union_reward = union_area/(2*dest_box.area - union_area)
-        if box_union_reward < self.accum_arrive_reward:
-            box_union_reward = 0 
-        else:
-            prev_arrive_reward = self.accum_arrive_reward
-            self.accum_arrive_reward = box_union_reward
-            box_union_reward -= prev_arrive_reward
-        return [time_cost ,rs_dist_reward ,dist_reward ,angle_reward ,box_union_reward]
-        
-    def get_reward(self, status, prev_state):
-        reward_info = [0,0,0,0,0]
-        if status == Status.CONTINUE:
-            reward_info = self._get_reward(prev_state, self.vehicle.state)
-        return reward_info
+    def get_reward(self, status, prev_state, action):
+        return self._get_reward(prev_state, self.vehicle.state, status, action)
 
     def step(self, action:np.ndarray = None):
         '''
@@ -317,8 +288,8 @@ class CarParking(gym.Env):
             If `use_lidar_observation` is `True`, then `obsercation['img'] = None`.
             If `use_lidar_observation` is `False`, then `obsercation['lidar'] = None`. 
 
-        ``reward_info`` (OrderedDict): different types of reward information, including:
-                time_cost ,rs_dist_reward ,dist_reward ,angle_reward ,box_union_reward
+        ``reward_info`` (OrderedDict): reward information, including:
+                progress ,collision ,smoothness
         `status` (`Status`): represent the state of vehicle, including:
                 `CONTINUE`, `ARRIVED`, `COLLIDED`, `OUTBOUND`, `OUTTIME`
         `info` (`OrderedDict`): other information.
@@ -327,24 +298,21 @@ class CarParking(gym.Env):
         prev_state = self.vehicle.state
         collide = False
         arrive = False
+        exec_steps = 0
         if action is not None:
             for simu_step_num in range(NUM_STEP):
                 prev_info = self.vehicle.step(action,step_time=1)
+                exec_steps += 1
                 if self._check_arrived():
                     arrive = True
                     break
                 if self._detect_collision():
-                    if simu_step_num == 0:
-                        collide = ENV_COLLIDE
-                        self.vehicle.retreat(prev_info)
-                    else:
-                        self.vehicle.retreat(prev_info)
-                    simu_step_num -= 1
+                    collide = ENV_COLLIDE
+                    self.vehicle.retreat(prev_info)
+                    exec_steps -= 1
                     break
-            simu_step_num += 1
-            # remove redundant trajectory
-            if simu_step_num > 1:
-                del self.vehicle.trajectory[-simu_step_num:-1]
+            if exec_steps > 1:
+                del self.vehicle.trajectory[-exec_steps:-1]
 
         self.t += 1
         observation = self.render(self.render_mode)
@@ -353,20 +321,22 @@ class CarParking(gym.Env):
         else:
             status = Status.COLLIDED if collide else self._check_status()
 
-        reward_list = self.get_reward(status, prev_state)
-        reward_info = OrderedDict({'time_cost':reward_list[0],\
-            'rs_dist_reward':reward_list[1],\
-            'dist_reward':reward_list[2],\
-            'angle_reward':reward_list[3],\
-            'box_union_reward':reward_list[4],})
+        reward_list = self.get_reward(status, prev_state, action)
+        reward_info = OrderedDict({
+            'progress': reward_list[0],
+            'collision': reward_list[1],
+            'smoothness': reward_list[2],
+        })
 
-        info = OrderedDict({'reward_info':reward_info,
-            'path_to_dest':None})
-        if self.t > 1 and status==Status.CONTINUE\
-            and self.vehicle.state.loc.distance(self.map.dest.loc)<RS_MAX_DIST:
-            rs_path_to_dest = self.find_rs_path(status)
-            if rs_path_to_dest is not None:
-                info['path_to_dest'] = rs_path_to_dest
+        if action is not None:
+            self.prev_action = np.array(action, dtype=float)
+
+        info = OrderedDict({'reward_info':reward_info, 'path_to_dest':None})
+        if self.t > 1 and status==Status.CONTINUE and \
+            self.vehicle.state.loc.distance(self.map.dest.loc) <= HYBRID_MAX_PLAN_DIST:
+            planner_path = self.find_hybrid_astar_path()
+            if planner_path is not None:
+                info['path_to_dest'] = planner_path
 
         return observation, reward_info, status, info
 
@@ -505,44 +475,28 @@ class CarParking(gym.Env):
         
         return observation
 
-    def find_rs_path(self,status):
-        '''
-        Find collision-free RS path. 
+    def find_hybrid_astar_path(self):
+        """
+        Plan a feasible path with hybrid A* using the occupancy grid.
 
         Returns:
-            path (PATH): the related PATH object which is collision-free.
-        '''
-        startX, startY, startYaw = self.vehicle.state.loc.x, self.vehicle.state.loc.y, self.vehicle.state.heading
-        goalX, goalY, goalYaw = self.map.dest.loc.x, self.map.dest.loc.y, self.map.dest.heading
-        radius = math.tan(VALID_STEER[-1])/WHEEL_BASE
-        #  Find all possible reeds-shepp paths between current and goal node
-        reedsSheppPaths = rsCurve.calc_all_paths(startX, startY, startYaw, goalX, goalY, goalYaw, radius, 0.1)
-
-        # Check if reedsSheppPaths is empty
-        if not reedsSheppPaths:
+            HybridAStarPath or None if no feasible path is found.
+        """
+        if not hasattr(self.map, 'occupancy_grid') or self.map.occupancy_grid is None:
             return None
+        origin = getattr(self.map, 'origin', (self.map.xmin, self.map.ymin))
+        return plan_hybrid_astar(
+            occupancy_grid=self.map.occupancy_grid,
+            resolution=self.map.grid_resolution,
+            origin=origin,
+            start_state=self.vehicle.state,
+            goal_state=self.map.dest,
+            collision_checker=self.is_traj_valid,
+        )
 
-        # Find path with lowest cost considering non-holonomic constraints
-        costQueue = heapdict()
-        for path in reedsSheppPaths:
-            costQueue[path] = path.L
-
-        # Find first path in priority queue that is collision free
-        min_path_len = -1
-        idx = 0
-        while len(costQueue)!=0:
-            idx += 1
-            path = costQueue.popitem()[0]
-            if min_path_len < 0:
-                min_path_len = path.L
-            if path.L > 1.6*min_path_len and idx > 2:
-                break
-            traj=[]
-            traj = [[path.x[k],path.y[k],path.yaw[k]] for k in range(len(path.x))]
-            traj_valid = self.is_traj_valid(traj)
-            if traj_valid:
-                return path
-        return None
+    def find_rs_path(self, status=None):
+        # Backward compatibility shim
+        return self.find_hybrid_astar_path()
     
     def is_traj_valid(self, traj):
         car_coords1 = np.array(VehicleBox.coords)[:4] # (4,2)

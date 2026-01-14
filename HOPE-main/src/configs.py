@@ -55,10 +55,53 @@ NUM_STEP = 10
 STEP_LENGTH = 5e-2  # seconds per internal sub-step
 
 # --------------------------------------------------------------------------- #
-# Scenario generation (env/parking_map_normal.py, env/parking_map_dlp.py)
+# Scenario generation (env/forest_map.py)
 # --------------------------------------------------------------------------- #
 MAP_LEVEL = 'Normal'  # default difficulty: ['Normal', 'Complex', 'Extrem', 'dlp']
-# Per-level bay/parallel lot sizing (meters) used when sampling scenes
+FOREST_GRID_RES = 0.25  # meters per occupancy cell
+FOREST_POLY_RESOLUTION = 10  # polygon resolution when approximating circles
+FOREST_MAP_SIZE = {  # (width, height) meters
+    'Normal': (32.0, 32.0),
+    'Complex': (40.0, 40.0),
+    'Extrem': (48.0, 48.0),
+    'dlp': (36.0, 36.0),
+}
+FOREST_OBS_DENSITY = {  # approximate obstacles per square meter
+    'Normal': 0.025,
+    'Complex': 0.04,
+    'Extrem': 0.055,
+    'dlp': 0.03,
+}
+FOREST_OBS_RADIUS_RANGE = {  # meters
+    'Normal': (0.25, 0.45),
+    'Complex': (0.25, 0.55),
+    'Extrem': (0.30, 0.65),
+    'dlp': (0.25, 0.50),
+}
+FOREST_MIN_CORRIDOR = {  # minimum desired free corridor width between obstacles
+    'Normal': 1.5,
+    'Complex': 1.2,
+    'Extrem': 1.0,
+    'dlp': 1.3,
+}
+FOREST_VEHICLE_CLEARANCE = max(WIDTH, LENGTH) / 2 + 0.15
+FOREST_BOUNDARY_MARGIN = 0.5  # padding to keep obstacles away from the map edge
+FOREST_SPAWN_MARGIN = 1.5  # clearance to keep start/goal away from edges/obstacles
+FOREST_MAX_SAMPLE_RETRY = 200  # attempts when sampling obstacles/start/goal
+FOREST_MIN_GOAL_SEPARATION = {
+    'Normal': 10.0,
+    'Complex': 12.0,
+    'Extrem': 14.0,
+    'dlp': 11.0,
+}
+FOREST_MAX_GOAL_SEPARATION = {
+    'Normal': 22.0,
+    'Complex': 26.0,
+    'Extrem': 30.0,
+    'dlp': 24.0,
+}
+
+# Legacy parking map parameters are kept for compatibility with unused parking generators.
 MIN_PARK_LOT_LEN_DICT = {'Extrem': LENGTH + 0.6,
                             'Complex': LENGTH + 0.9,
                             'Normal': LENGTH * 1.25,}
@@ -73,7 +116,6 @@ MAX_PARK_LOT_WIDTH_DICT = {
     'Complex': WIDTH + 0.85,
     'Normal': WIDTH + 1.2,
 }
-# Wall distances for parallel/bay layouts
 PARA_PARK_WALL_DIST_DICT = {
     'Extrem': 3.5,
     'Complex': 4.0,
@@ -83,22 +125,19 @@ BAY_PARK_WALL_DIST_DICT = {
     'Complex': 6.0,
     'Normal': 7.0,
 }
-# Number of extra obstacles sampled per level
 N_OBSTACLE_DICT = {
     'Extrem': 8,
     'Complex': 5,
     'Normal': 3,
 }
-
-# Additional sampling constraints
-MIN_DIST_TO_OBST = 0.1     # minimum clearance between boxes when placing obstacles
-MAX_DRIVE_DISTANCE = 15.0  # cap on sampled start/dest separation (meters)
-DROUP_OUT_OBST = 0.0       # probability to drop a sampled obstacle for variability
+MIN_DIST_TO_OBST = 0.1
+MAX_DRIVE_DISTANCE = 15.0
+DROUP_OUT_OBST = 0.0
 
 # --------------------------------------------------------------------------- #
 # Environment rendering, observations, and timing (env/car_parking_base.py)
 # --------------------------------------------------------------------------- #
-ENV_COLLIDE = False  # if True, collision immediately ends; False allows retreat logic
+ENV_COLLIDE = True  # if True, collision immediately ends; False allows retreat logic
 
 # Colors used throughout pygame rendering and Obs_Processor masking
 BG_COLOR = (255, 255, 255, 255)
@@ -136,8 +175,10 @@ TOLERANT_TIME = 200  # max env steps before OUTTIME
 USE_LIDAR = True     # include lidar observation channel
 USE_IMG = True       # include image observation channel
 USE_ACTION_MASK = True  # include discrete action mask channel
-MAX_DIST_TO_DEST = 20   # cap for normalized target distance feature
-K = 48  # render scale factor (px per world unit) used in world->screen transform
+MAX_DIST_TO_DEST = 40   # cap for normalized target distance feature
+GOAL_TOLERANCE = 1.5    # success radius around goal (meters)
+GOAL_HEADING_TOL = None # optional heading tolerance (radians), set None to ignore
+K = 24  # render scale factor (px per world unit) used in world->screen transform
 RS_MAX_DIST = 10  # max distance to try RS planner guidance
 RENDER_TRAJ = True  # render vehicle footprints
 
@@ -152,6 +193,19 @@ for i in np.arange(VALID_STEER[-1], -(VALID_STEER[-1] + VALID_STEER[-1] / PRECIS
 for i in np.arange(VALID_STEER[-1], -(VALID_STEER[-1] + VALID_STEER[-1] / PRECISION), -VALID_STEER[-1] / PRECISION):
     discrete_actions.append([i, -step_speed])
 N_DISCRETE_ACTION = len(discrete_actions)
+
+# --------------------------------------------------------------------------- #
+# Navigation planner defaults (env/hybrid_astar.py)
+# --------------------------------------------------------------------------- #
+HYBRID_MAX_PLAN_DIST = 30.0  # meters within which to trigger fallback planner
+HYBRID_YAW_BINS = 48         # heading discretization for hybrid A*
+HYBRID_STEER_SET = np.linspace(VALID_STEER[0], VALID_STEER[1], 5)
+HYBRID_SPEED_SET = [1.5, -1.0]  # forward and reverse speeds used by planner
+HYBRID_STEP_TIME = 5         # env sub-steps per planner primitive
+HYBRID_SIM_STEPS = 5         # internal integration slices per primitive
+HYBRID_DT = STEP_LENGTH      # integration timestep
+HYBRID_MAX_NODES = 4000      # search budget
+HYBRID_HEADING_WEIGHT = 0.5  # weight on heading error in heuristic
 
 # --------------------------------------------------------------------------- #
 # RL model/training hyperparameters (model/agent/*.py)
@@ -222,15 +276,19 @@ CRITIC_CONFIGS = {
 }
 
 # Reward shaping (env/env_wrapper.py uses these to scale components)
-REWARD_RATIO = 0.1  # overall scalar applied to shaped reward
+REWARD_RATIO = 1.0  # overall scalar applied to shaped reward
 from typing import OrderedDict
 REWARD_WEIGHT = OrderedDict({
-    'time_cost': 1,       # per-step penalty
-    'rs_dist_reward': 0,  # reeds-shepp path length reduction reward (unused if 0)
-    'dist_reward': 5,     # dense distance reward toward goal
-    'angle_reward': 0,    # heading alignment reward (unused if 0)
-    'box_union_reward': 10,  # overlap reward for reaching parking box
+    'progress': 1.0,     # positive when moving toward the goal
+    'collision': 1.0,    # large penalty applied on collision/out-of-bounds/timeout
+    'smoothness': 0.1,   # small penalty on abrupt control changes
 })
+COLLISION_PENALTY = 25.0
+OUTBOUND_PENALTY = 25.0
+TIMEOUT_PENALTY = 10.0
+PROGRESS_CLIP = 2.0
+SMOOTHNESS_STEER_WEIGHT = 0.5
+SMOOTHNESS_SPEED_WEIGHT = 0.1
 
 # Auxiliary discrete action head config (used by planner/aux models)
 CONFIGS_ACTION = {

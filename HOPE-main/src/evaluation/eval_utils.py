@@ -16,7 +16,6 @@ except ImportError:
     pygame = None
 
 from env.vehicle import Status
-from env.map_level import get_map_level
 from configs import *
 
 def _save_episode_frame(env, log_path: str, episode_idx: int):
@@ -160,8 +159,8 @@ def eval(env, agent, episode=2000, log_path='', multi_level=False, post_proc_act
         print('average reward per case: ')
         for k in case_ids:
             env.reset(k)
-            print('case %s (%s) :'%(k,get_map_level(env.map.start, env.map.dest, env.map.obstacles))\
-                , np.mean(succ_rate_case[k]))
+            # Map-level classification is bypassed; report case ID only
+            print('case %s :' % k, np.mean(succ_rate_case[k]))
         for k in case_ids:
             print('case %s :'%k, np.mean(reward_case[k]), np.mean(step_record[k]), '+-(%s)'%np.std(step_record[k]))
 

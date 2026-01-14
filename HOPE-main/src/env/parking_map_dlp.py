@@ -6,7 +6,6 @@ from numpy.random import randn, random
 from shapely.geometry import LinearRing
 from typing import List
 
-from env.map_level import get_map_level
 from env.vehicle import State
 from env.map_base import *
 from configs import *
@@ -81,7 +80,8 @@ class ParkingMapDLP(object):
             self.flip_dest_orientation()
         if random() > 0.5:
             self.flip_start_orientation()
-        self.map_level = get_map_level(self.start, self.dest, self.obstacles)
+        # Bypass dynamic map-level classification; treat DLP cases as a fixed level
+        self.map_level = 'dlp'
 
         return self.start
     

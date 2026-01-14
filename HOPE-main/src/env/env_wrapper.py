@@ -1,5 +1,4 @@
 
-
 import numpy as np
 from gym import Wrapper
 
@@ -15,21 +14,9 @@ def reward_shaping(*args):
 
     '''
     obs, reward_info, status, info = args
-    if status == Status.CONTINUE:
-        reward = 0
-        for reward_type in REWARD_WEIGHT.keys():
-            reward += REWARD_WEIGHT[reward_type]*reward_info[reward_type]
-    elif status == Status.OUTBOUND:
-        reward = -50
-    elif status == Status.OUTTIME:
-        reward = -1
-    elif status == Status.ARRIVED:
-        reward = 50
-    elif status == Status.COLLIDED:
-        reward = -50
-    else:
-        print(status)
-        print('Never reach here !!!')
+    reward = 0.0
+    for reward_type in REWARD_WEIGHT.keys():
+        reward += REWARD_WEIGHT[reward_type]*reward_info.get(reward_type, 0.0)
     reward *= REWARD_RATIO
     info['status'] = status
     return obs, reward, status, info
@@ -83,4 +70,3 @@ class CarParkingWrapper(Wrapper):
     def reset(self, *args):
         obs = self.env.reset(*args)
         return self.obs_func(obs)
-
