@@ -56,13 +56,17 @@ class KSModel(object):
         step_len: float,
         n_step: int,
         speed_range: list,
-        angle_range: list
+        angle_range: list,
+        accel_range: list = VALID_ACCEL,
+        yaw_rate_range: list = VALID_ANGULAR_SPEED,
     ):
         self.wheel_base = wheel_base
         self.step_len = step_len
         self.n_step = n_step
         self.speed_range = speed_range
         self.angle_range = angle_range
+        self.accel_range = accel_range
+        self.yaw_rate_range = yaw_rate_range
         self.mini_iter = 20
 
 
@@ -80,10 +84,23 @@ class KSModel(object):
         new_state = copy.deepcopy(state)
         x, y = new_state.loc.x, new_state.loc.y
         steer, speed = action
-        new_state.steering = steer
-        new_state.speed = speed
-        new_state.speed = np.clip(new_state.speed, *self.speed_range)
-        new_state.steering = np.clip(new_state.steering, *self.angle_range)
+        target_speed = np.clip(speed, *self.speed_range)
+        # apply accel/decel limits over this integration step
+        max_dv = self.accel_range[1] * self.step_len * step_time
+        min_dv = self.accel_range[0] * self.step_len * step_time
+        delta_v = np.clip(target_speed - state.speed, min_dv, max_dv)
+        new_state.speed = state.speed + delta_v
+
+        target_steer = np.clip(steer, *self.angle_range)
+        # enforce yaw-rate constraints by backing off steering at the current speed
+        if np.abs(new_state.speed) > 1e-5:
+            desired_yaw_rate = new_state.speed * np.tan(target_steer) / self.wheel_base
+            clamped_yaw_rate = np.clip(desired_yaw_rate, *self.yaw_rate_range)
+            if clamped_yaw_rate != desired_yaw_rate:
+                target_steer = np.arctan(
+                    clamped_yaw_rate * self.wheel_base / np.abs(new_state.speed)
+                )
+        new_state.steering = target_steer
 
         for _ in range(step_time):
             for _ in range(self.mini_iter):
@@ -105,7 +122,9 @@ class Vehicle:
         step_len: float = STEP_LENGTH,
         n_step: int = NUM_STEP,
         speed_range: list = VALID_SPEED, 
-        angle_range: list = VALID_STEER
+        angle_range: list = VALID_STEER,
+        accel_range: list = VALID_ACCEL,
+        yaw_rate_range: list = VALID_ANGULAR_SPEED
     ) -> None:
 
         self.initial_state: list = None
@@ -113,7 +132,7 @@ class Vehicle:
         self.box: LinearRing = None
         self.trajectory: List[State] = []
         self.kinetic_model: Callable = \
-            KSModel(wheel_base, step_len, n_step, speed_range, angle_range)
+            KSModel(wheel_base, step_len, n_step, speed_range, angle_range, accel_range, yaw_rate_range)
         self.color = COLOR_POOL[0]
         self.v_max = None
         self.v_min = None

@@ -23,11 +23,13 @@ SEED = 42  # used by eval/train scripts to seed env, action space, numpy, torch
 # --------------------------------------------------------------------------- #
 # Vehicle geometry and dynamic limits (env/vehicle.py)
 # --------------------------------------------------------------------------- #
-WHEEL_BASE = 2.8           # axle-to-axle distance; drives turning radius and RS planner
-FRONT_HANG = 0.96          # front overhang (axle to bumper), meters
-REAR_HANG = 0.93           # rear overhang (axle to bumper), meters
+# Real platform (924mm L x 740mm W x 350mm H, 0.6m wheelbase/track)
+WHEEL_BASE = 0.6           # axle-to-axle distance; drives turning radius and RS planner
+FRONT_HANG = 0.162         # front overhang (axle to bumper), meters
+REAR_HANG = 0.162          # rear overhang (axle to bumper), meters
 LENGTH = WHEEL_BASE + FRONT_HANG + REAR_HANG  # total bumper-to-bumper length
-WIDTH = 1.94               # vehicle width used for collisions and lot sizing
+WIDTH = 0.74               # vehicle width used for collisions and lot sizing
+TRACK_WIDTH = 0.6          # wheel track width center-to-center
 
 from shapely.geometry import LinearRing
 VehicleBox = LinearRing([
@@ -43,10 +45,10 @@ COLOR_POOL = [
 ]
 
 # Action/kinematics bounds enforced in Vehicle.step and rsCurve planner
-VALID_SPEED = [-2.5, 2.5]           # m/s, symmetric forward/backward cap
-VALID_STEER = [-0.75, 0.75]         # radians, steering angle clamp
-VALID_ACCEL = [-1.0, 1.0]           # m/s^2, accel clamp for kinodynamic model
-VALID_ANGULAR_SPEED = [-0.5, 0.5]   # rad/s, yaw-rate clamp
+VALID_SPEED = [-2.6944, 2.6944]          # m/s, from 9.7 km/h top speed (symmetric fwd/rev)
+VALID_STEER = [-0.4712389, 0.4712389]    # radians, ±27 deg steering angle clamp
+VALID_ACCEL = [-1.5, 1.5]                # m/s^2, accel/decel from platform
+VALID_ANGULAR_SPEED = [-1.22348, 1.22348] # rad/s, ±70.1 deg/s yaw-rate clamp
 
 # Internal sim sub-steps per env step (controls smoothness of motion)
 NUM_STEP = 10
@@ -143,7 +145,7 @@ RENDER_TRAJ = True  # render vehicle footprints
 # Discrete action mask (model/action_mask.py uses these)
 # --------------------------------------------------------------------------- #
 PRECISION = 10  # steering discretization steps across [-max, max]
-step_speed = 1  # base speed magnitude for discrete action grid (forward/backward)
+step_speed = round(VALID_SPEED[1] * 0.4, 3)  # base speed magnitude for discrete action grid (forward/backward)
 discrete_actions = []
 for i in np.arange(VALID_STEER[-1], -(VALID_STEER[-1] + VALID_STEER[-1] / PRECISION), -VALID_STEER[-1] / PRECISION):
     discrete_actions.append([i, step_speed])
