@@ -5,15 +5,15 @@ Ackermann car navigation in a forest-style occupancy grid with random start/goal
 
 import sys
 sys.path.append("../")
-from typing import Optional
+from typing import Dict, Optional, OrderedDict, Tuple
 import math
-from typing import OrderedDict
 
 import numpy as np
 import gym
 from gym import spaces
 from gym.error import DependencyNotInstalled
 from shapely.affinity import affine_transform
+from shapely.geometry import Polygon, LinearRing
 try:
     # As pygame is necessary for using the environment (reset and step) even without a render mode
     #   therefore, pygame is a necessary import for the environment.
@@ -50,6 +50,8 @@ class CarParking(gym.Env):
         use_img_observation: bool=USE_IMG,
         use_action_mask: bool=USE_ACTION_MASK,
     ):
+        if use_action_mask and not use_lidar_observation:
+            raise ValueError("Action mask requires lidar observations; set use_lidar_observation=True.")
         super().__init__()
 
         self.verbose = verbose
@@ -213,11 +215,27 @@ class CarParking(gym.Env):
         return list(transformed.coords)
 
     def _detect_collision(self):
-        # return False
+        vehicle_poly = Polygon(self.vehicle.box) if self.vehicle is not None else None
+        if vehicle_poly is None:
+            return False
         for obstacle in self.map.obstacles:
-            if self.vehicle.box.intersects(obstacle.shape):
+            shape = getattr(obstacle, "shape", obstacle)
+            solid = self._to_solid_polygon(shape)
+            if solid is None:
+                continue
+            if vehicle_poly.intersects(solid):
                 return True
         return False
+
+    def _to_solid_polygon(self, shape):
+        if isinstance(shape, Polygon):
+            return shape
+        if isinstance(shape, LinearRing):
+            return Polygon(shape)
+        try:
+            return Polygon(shape)
+        except Exception:
+            return None
     
     def _detect_outbound(self):
         x, y = self.vehicle.state.loc.x, self.vehicle.state.loc.y
@@ -427,7 +445,7 @@ class CarParking(gym.Env):
         rel_angle = math.atan2(dest_pos[1]-ego_pos[1], dest_pos[0]-ego_pos[0]) - ego_pos[2]
         rel_dest_heading = dest_pos[2] - ego_pos[2]
         tgt_repr = np.array([rel_distance, math.cos(rel_angle), math.sin(rel_angle),\
-            math.cos(rel_dest_heading), math.cos(rel_dest_heading)])
+            math.cos(rel_dest_heading), math.sin(rel_dest_heading)])
         return tgt_repr 
 
     def render(self, mode: str = "human"):
@@ -485,13 +503,54 @@ class CarParking(gym.Env):
         if not hasattr(self.map, 'occupancy_grid') or self.map.occupancy_grid is None:
             return None
         origin = getattr(self.map, 'origin', (self.map.xmin, self.map.ymin))
+
+        action_validator = None
+        if hasattr(self, "action_filter") and self.use_lidar_observation:
+            obstacle_shapes = [getattr(obs, "shape", obs) for obs in self.map.obstacles]
+            grid = self.map.occupancy_grid
+            resolution = self.map.grid_resolution
+            yaw_bins = HYBRID_YAW_BINS
+
+            mask_steps = float(getattr(self.action_filter, "n_iter", HYBRID_SIM_STEPS))
+            required_ratio = min(1.0, HYBRID_SIM_STEPS / mask_steps) if mask_steps > 0 else 1.0
+
+            def _action_key(steer: float, speed: float) -> Tuple[int, int]:
+                return (int(round(float(steer) * 1e6)), int(round(float(speed) * 1e3)))
+
+            action_to_index = {_action_key(s, v): i for i, (s, v) in enumerate(discrete_actions)}
+            cached_step_len: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+            def action_validator(state: State, steer: float, speed: float) -> bool:
+                gx = int((state.loc.x - origin[0]) / resolution)
+                gy = int((state.loc.y - origin[1]) / resolution)
+                if gx < 0 or gy < 0 or gx >= grid.shape[1] or gy >= grid.shape[0]:
+                    return False
+
+                yaw = (state.heading + 2 * math.pi) % (2 * math.pi)
+                yaw_bin = int(yaw // (2 * math.pi / yaw_bins))
+
+                cache_key = (gx, gy, yaw_bin)
+                step_len = cached_step_len.get(cache_key)
+                if step_len is None:
+                    lidar_obs = self.lidar.get_observation(state, obstacle_shapes)
+                    step_len = self.action_filter.get_steps(lidar_obs)
+                    cached_step_len[cache_key] = step_len
+
+                action_idx = action_to_index.get(_action_key(steer, speed))
+                if action_idx is None:
+                    actions = np.asarray(discrete_actions, dtype=float)
+                    delta = actions - np.asarray([steer, speed], dtype=float)
+                    action_idx = int(np.argmin(np.sum(delta * delta, axis=1)))
+
+                return float(step_len[action_idx]) >= required_ratio
+
         return plan_hybrid_astar(
             occupancy_grid=self.map.occupancy_grid,
             resolution=self.map.grid_resolution,
             origin=origin,
             start_state=self.vehicle.state,
             goal_state=self.map.dest,
-            collision_checker=self.is_traj_valid,
+            action_validator=action_validator,
         )
 
     def find_rs_path(self, status=None):
@@ -499,87 +558,35 @@ class CarParking(gym.Env):
         return self.find_hybrid_astar_path()
     
     def is_traj_valid(self, traj):
-        car_coords1 = np.array(VehicleBox.coords)[:4] # (4,2)
-        car_coords2 = np.array(VehicleBox.coords)[1:] # (4,2)
-        car_coords_x1 = car_coords1[:,0].reshape(1,-1)
-        car_coords_y1 = car_coords1[:,1].reshape(1,-1) # (1,4)
-        car_coords_x2 = car_coords2[:,0].reshape(1,-1)
-        car_coords_y2 = car_coords2[:,1].reshape(1,-1) # (1,4)
-        vxs = np.array([t[0] for t in traj])
-        vys = np.array([t[1] for t in traj])
-        # check outbound
-        if np.min(vxs) < self.map.xmin or np.max(vxs) > self.map.xmax \
-        or np.min(vys) < self.map.ymin or np.max(vys) > self.map.ymax:
-            return False
-        vthetas = np.array([t[2] for t in traj])
-        cos_theta = np.cos(vthetas).reshape(-1,1) # (T,1)
-        sin_theta = np.sin(vthetas).reshape(-1,1)
-        vehicle_coords_x1 = cos_theta*car_coords_x1 - sin_theta*car_coords_y1 + vxs.reshape(-1,1) # (T,4)
-        vehicle_coords_y1 = sin_theta*car_coords_x1 + cos_theta*car_coords_y1 + vys.reshape(-1,1)
-        vehicle_coords_x2 = cos_theta*car_coords_x2 - sin_theta*car_coords_y2 + vxs.reshape(-1,1) # (T,4)
-        vehicle_coords_y2 = sin_theta*car_coords_x2 + cos_theta*car_coords_y2 + vys.reshape(-1,1)
-        vx1s = vehicle_coords_x1.reshape(-1,1)
-        vx2s = vehicle_coords_x2.reshape(-1,1)
-        vy1s = vehicle_coords_y1.reshape(-1,1)
-        vy2s = vehicle_coords_y2.reshape(-1,1)
-        # Line 1: the edges of vehicle box, ax + by + c = 0
-        a = (vy2s - vy1s).reshape(-1,1) # (4*t,1)
-        b = (vx1s - vx2s).reshape(-1,1)
-        c = (vy1s*vx2s - vx1s*vy2s).reshape(-1,1)
-        
-        # convert obstacles(LinerRing) to edges ((x1,y1), (x2,y2))
-        x_max = np.max(vx1s) + 5
-        x_min = np.min(vx1s) - 5
-        y_max = np.max(vy1s) + 5
-        y_min = np.min(vy1s) - 5
-
-        x1s, x2s, y1s, y2s = [], [], [], []
+        obstacle_polys = []
         for obst in self.map.obstacles:
-            if isinstance(obst, Area):
-                obst = obst.shape
-            obst_coords = np.array(obst.coords) # (n+1,2)
-            if (obst_coords[:,0] > x_max).all() or (obst_coords[:,0] < x_min).all()\
-                or (obst_coords[:,1] > y_max).all() or (obst_coords[:,1] < y_min).all():
-                continue
-            x1s.extend(list(obst_coords[:-1, 0]))
-            x2s.extend(list(obst_coords[1:, 0]))
-            y1s.extend(list(obst_coords[:-1, 1]))
-            y2s.extend(list(obst_coords[1:, 1]))
-        if len(x1s) == 0: # no obstacle around
+            shape = getattr(obst, "shape", obst)
+            solid = self._to_solid_polygon(shape)
+            if solid is not None:
+                obstacle_polys.append(solid)
+        if len(obstacle_polys) == 0:
             return True
-        x1s, x2s, y1s, y2s  = np.array(x1s).reshape(1,-1), np.array(x2s).reshape(1,-1),\
-            np.array(y1s).reshape(1,-1), np.array(y2s).reshape(1,-1), 
-        # Line 2: the edges of obstacles, dx + ey + f = 0
-        d = (y2s - y1s).reshape(1,-1) # (1,E)
-        e = (x1s - x2s).reshape(1,-1)
-        f = (y1s*x2s - x1s*y2s).reshape(1,-1)
 
-        # calculate the intersections
-        det = a*e - b*d # (4, E)
-        parallel_line_pos = (det==0) # (4, E)
-        det[parallel_line_pos] = 1 # temporarily set "1" to avoid "divided by zero"
-        raw_x = (b*f - c*e)/det # (4, E)
-        raw_y = (c*d - a*f)/det
+        def vehicle_polygon(pose):
+            x, y, theta = pose
+            cos_theta = np.cos(theta)
+            sin_theta = np.sin(theta)
+            mat = [cos_theta, -sin_theta, sin_theta, cos_theta, x, y]
+            try:
+                return Polygon(affine_transform(VehicleBox, mat))
+            except Exception:
+                return None
 
-        collide_map_x = np.ones_like(raw_x, dtype=np.uint8)
-        collide_map_y = np.ones_like(raw_x, dtype=np.uint8)
-        # the false positive intersections on line L2(not on edge L2)
-        collide_map_x[raw_x>np.maximum(x1s, x2s)] = 0
-        collide_map_x[raw_x<np.minimum(x1s, x2s)] = 0
-        collide_map_y[raw_y>np.maximum(y1s, y2s)] = 0
-        collide_map_y[raw_y<np.minimum(y1s, y2s)] = 0
-        # the false positive intersections on line L1(not on edge L1)
-        collide_map_x[raw_x>np.maximum(vx1s, vx2s)] = 0
-        collide_map_x[raw_x<np.minimum(vx1s, vx2s)] = 0
-        collide_map_y[raw_y>np.maximum(vy1s, vy2s)] = 0
-        collide_map_y[raw_y<np.minimum(vy1s, vy2s)] = 0
-
-        collide_map = collide_map_x*collide_map_y
-        collide_map[parallel_line_pos] = 0
-        collide = np.sum(collide_map) > 0
-
-        if collide:
-            return False
+        for pose in traj:
+            poly = vehicle_polygon(pose)
+            if poly is None:
+                return False
+            minx, miny, maxx, maxy = poly.bounds
+            if minx < self.map.xmin or maxx > self.map.xmax or miny < self.map.ymin or maxy > self.map.ymax:
+                return False
+            for obst_poly in obstacle_polys:
+                if poly.intersects(obst_poly):
+                    return False
         return True
 
     def close(self):

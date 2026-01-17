@@ -4,10 +4,11 @@ from configs import VALID_SPEED, VALID_STEER
 
 
 class RsPlanner(object):
-    def __init__(self, step_ratio:float=None) -> None:
+    def __init__(self, step_ratio: float = None, normalize_actions: bool = True) -> None:
         self.route = None
         self.actions = []
         self.step_ratio = step_ratio
+        self.normalize_actions = normalize_actions
 
     def reset(self,):
         self.route = None
@@ -19,9 +20,20 @@ class RsPlanner(object):
             return
         self.route = planner_path
         controls = planner_path.controls if hasattr(planner_path, "controls") else planner_path
+        steer_scale = (VALID_STEER[1] - VALID_STEER[0]) / 2
+        speed_scale = (VALID_SPEED[1] - VALID_SPEED[0]) / 2
+        steer_center = (VALID_STEER[1] + VALID_STEER[0]) / 2
+        speed_center = (VALID_SPEED[1] + VALID_SPEED[0]) / 2
+        steer_scale = steer_scale if abs(steer_scale) > 1e-6 else 1.0
+        speed_scale = speed_scale if abs(speed_scale) > 1e-6 else 1.0
         for ctrl in controls:
             steer = float(np.clip(ctrl[0], *VALID_STEER))
             speed = float(np.clip(ctrl[1], *VALID_SPEED))
+            if self.normalize_actions:
+                steer = float((steer - steer_center) / steer_scale)
+                speed = float((speed - speed_center) / speed_scale)
+                steer = float(np.clip(steer, -1.0, 1.0))
+                speed = float(np.clip(speed, -1.0, 1.0))
             self.actions.append([steer, speed])
 
     def get_action(self, ):

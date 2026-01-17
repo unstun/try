@@ -176,7 +176,7 @@ USE_LIDAR = True     # include lidar observation channel
 USE_IMG = True       # include image observation channel
 USE_ACTION_MASK = True  # include discrete action mask channel
 MAX_DIST_TO_DEST = 40   # cap for normalized target distance feature
-GOAL_TOLERANCE = 1.5    # success radius around goal (meters)
+GOAL_TOLERANCE = 0.5    # success radius around goal (meters)
 GOAL_HEADING_TOL = None # optional heading tolerance (radians), set None to ignore
 K = 24  # render scale factor (px per world unit) used in world->screen transform
 RS_MAX_DIST = 10  # max distance to try RS planner guidance
@@ -197,7 +197,7 @@ N_DISCRETE_ACTION = len(discrete_actions)
 # --------------------------------------------------------------------------- #
 # Navigation planner defaults (env/hybrid_astar.py)
 # --------------------------------------------------------------------------- #
-HYBRID_MAX_PLAN_DIST = 30.0  # meters within which to trigger fallback planner
+HYBRID_MAX_PLAN_DIST = 0.5  # meters within which to trigger fallback planner
 HYBRID_YAW_BINS = 48         # heading discretization for hybrid A*
 HYBRID_STEER_SET = np.linspace(VALID_STEER[0], VALID_STEER[1], 5)
 HYBRID_SPEED_SET = [1.5, -1.0]  # forward and reverse speeds used by planner
@@ -205,7 +205,7 @@ HYBRID_STEP_TIME = 5         # env sub-steps per planner primitive
 HYBRID_SIM_STEPS = 5         # internal integration slices per primitive
 HYBRID_DT = STEP_LENGTH      # integration timestep
 HYBRID_MAX_NODES = 4000      # search budget
-HYBRID_HEADING_WEIGHT = 0.5  # weight on heading error in heuristic
+HYBRID_HEADING_WEIGHT = 30  # weight on heading error in heuristic
 
 # --------------------------------------------------------------------------- #
 # RL model/training hyperparameters (model/agent/*.py)

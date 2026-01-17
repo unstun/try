@@ -51,6 +51,43 @@ From `HOPE-main/`:
 - Forest difficulty: obstacle density/size/corridor in `FOREST_*` constants.
 - Planner budget: `HYBRID_MAX_NODES`, `HYBRID_YAW_BINS`, steer/speed sets in `configs.py`.
 
+## Hybrid A* + SAC fusion: issues + alternatives
+**Current behavior (baseline)**: when the env emits `info['path_to_dest']`, `ParkingAgent` hard-switches to executing the planner's open-loop control sequence until it ends, otherwise SAC acts normally.
+
+**Sanity check before comparing schemes**
+- The learning interface expects **normalized actions in `[-1, 1]`**, then `CarParkingWrapper` rescales to env units (`env/env_wrapper.py:action_rescale`). Make sure any planner-provided controls are normalized the same way before stepping the wrapped env.
+- If `USE_ACTION_MASK=True`, the mask is over `discrete_actions`; the sampling logic should normalize *both* steer and speed consistently with the wrapper.
+
+### A) Receding-horizon planner (execute 1 step)
+- Replan every step (or every N steps), but execute only the *first* planner action (MPC-style). Optional: keep SAC as a residual on top of the planner action.
+- Pros: avoids open-loop drift; Cons: higher compute, still planner-dependent.
+- Touch points: `src/model/agent/parking_agent.py` (arbitration), `src/env/car_parking_base.py` (planner trigger cadence).
+
+### B) Planner-as-guidance (waypoints, policy stays in control)
+- Use Hybrid A* to provide K waypoints / a short local reference curve; feed that as extra observation (or replace `target` with "next waypoint in ego frame") and let SAC output controls.
+- Pros: smoother learning + better global context; Cons: needs obs/encoder changes + retraining.
+- Touch points: `src/env/car_parking_base.py:_get_targt_repr` (subgoal), `src/model/network.py` (add modality / embed).
+
+### C) Safety shield (policy action with last-moment correction)
+- SAC proposes an action; a fast safety check (action mask, 1-step rollout, or occupancy lookup) either (1) projects to nearest safe discrete action, or (2) falls back to a planner-suggested action.
+- Pros: preserves policy autonomy + safety; Cons: can introduce discontinuities; safety checker quality matters.
+- Touch points: `src/model/action_mask.py` (projection), `src/model/agent/parking_agent.py` (shield logic).
+
+### D) Options / meta-controller (learn when to call planner)
+- Treat "planner-follow" as an option; SAC (or a small gating net) decides when to enter/exit it (e.g., stuck detection, low-clearance states, near-goal).
+- Pros: planner used only when beneficial; Cons: extra training complexity and tuning.
+
+### E) Planner as teacher (BC/DAgger + SAC fine-tune)
+- Use Hybrid A* trajectories to (1) prefill replay buffer, (2) behavior-clone the actor, then fine-tune with SAC. Optional Q-filter: only imitate when critic estimates planner action is better.
+- Pros: more sample-efficient; Cons: planner bias; needs dataset curation and failure handling.
+
+### F) Learned heuristic / value-guided Hybrid A*
+- Use a learned cost-to-go (critic or separate net) as the Hybrid A* heuristic / expansion bias, then track the resulting path with SAC (or a classical tracker).
+- Pros: can improve planning speed/quality; Cons: research-heavy, harder to debug.
+
+**Suggested ablations to report**
+- Success rate + collision rate; mean steps-to-goal; mean return; % time under planner/shield; planner wall-clock per episode.
+
 ## Train / eval commands (same scripts, now forest by default)
 - Train SAC (uses forest sampler via `CarParking` defaults):
   ```bash

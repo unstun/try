@@ -216,9 +216,13 @@ class ActionMask():
 
         possible_actions = np.array(self.action_space)
         # deal the scaling
-        scale_steer = VALID_STEER[1]
-        scale_speed = 1
-        possible_actions = possible_actions/np.array([scale_steer, scale_speed])
+        steer_scale = (VALID_STEER[1] - VALID_STEER[0]) / 2
+        speed_scale = (VALID_SPEED[1] - VALID_SPEED[0]) / 2
+        steer_center = (VALID_STEER[1] + VALID_STEER[0]) / 2
+        speed_center = (VALID_SPEED[1] + VALID_SPEED[0]) / 2
+        steer_scale = steer_scale if abs(steer_scale) > 1e-6 else 1.0
+        speed_scale = speed_scale if abs(speed_scale) > 1e-6 else 1.0
+        possible_actions = (possible_actions - np.array([steer_center, speed_center])) / np.array([steer_scale, speed_scale])
         prob = calculate_probability(action_mean, action_std, possible_actions)
         exp_prob = np.exp(prob) * action_mask
         prob_softmax = exp_prob / np.sum(exp_prob)
